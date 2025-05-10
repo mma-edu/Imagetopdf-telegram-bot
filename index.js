@@ -42,7 +42,7 @@ bot.command('help', (ctx) => {
     "1. Send me images (as photos or files)\n" +
     "2. When ready, type /convert\n" +
     "3. I'll send you a PDF with all images\n\n" +
-    "• Max 100 images per PDF\n" +
+    "• Max 50 images per PDF\n" +
     "• Images are ordered by send time\n" +
     "• /cancel clears your current images",
     { parse_mode: 'Markdown' }
@@ -85,8 +85,8 @@ bot.on('document', async (ctx) => {
 
 // Process image attachment
 async function processImage(ctx, file) {
-  if (ctx.session.images.length >= 100) {
-    return ctx.reply("⚠️ Maximum 100 images per PDF. Type /convert to generate.");
+  if (ctx.session.images.length >= 50) {
+    return ctx.reply("⚠️ Maximum 50 images per PDF. Type /convert to generate.");
   }
 
   ctx.reply("⏳ Processing image...");
@@ -103,7 +103,7 @@ async function processImage(ctx, file) {
       .toBuffer();
     
     ctx.session.images.push(processedImage);
-    ctx.reply(`✅ Image added (${ctx.session.images.length}/100). Send more or /convert.`);
+    ctx.reply(`✅ Image added (${ctx.session.images.length}/50). Send more or /convert.`);
   } catch (error) {
     console.error("Processing error:", error);
     ctx.reply("❌ Failed to process image. Please try another file.");
