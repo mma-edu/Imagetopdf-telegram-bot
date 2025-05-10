@@ -12,29 +12,9 @@ if (!process.env.BOT_TOKEN) {
   process.exit(1);
 }
 
-// Session storage with timestamp tracking
+// Session storage
 const userSessions = {};
-const SESSION_TIMEOUT = 60 * 60 * 1000; // 1 hour in milliseconds
 const MAX_IMAGES_PER_USER = 50; // Set to 50 as requested
-
-// Session cleanup function
-function cleanupSessions() {
-  const now = Date.now();
-  let cleanedCount = 0;
-
-  for (const userId in userSessions) {
-    if (!userSessions[userId].lastActive || 
-        (now - userSessions[userId].lastActive > SESSION_TIMEOUT)) {
-      delete userSessions[userId];
-      cleanedCount++;
-    }
-  }
-
-  console.log(`[Cleanup] Removed ${cleanedCount} inactive sessions. Current sessions: ${Object.keys(userSessions).length}`);
-}
-
-// Start hourly cleanup
-setInterval(cleanupSessions, SESSION_TIMEOUT);
 
 // Middleware to handle user sessions
 bot.use(async (ctx, next) => {
@@ -43,11 +23,8 @@ bot.use(async (ctx, next) => {
   const userId = ctx.from.id;
   if (!userSessions[userId]) {
     userSessions[userId] = { 
-      images: [],
-      lastActive: Date.now()
+      images: []
     };
-  } else {
-    userSessions[userId].lastActive = Date.now();
   }
   
   ctx.session = userSessions[userId];
@@ -76,8 +53,7 @@ bot.command('help', (ctx) => {
     "3. I'll send you a PDF with all images\n\n" +
     "• Max 50 images per PDF\n" +
     "• Images are ordered by send time\n" +
-    "• /cancel clears your current images\n" +
-    "• Sessions expire after 1 hour of inactivity",
+    "• /cancel clears your current images",
     { parse_mode: 'Markdown' }
   );
 });
@@ -210,8 +186,7 @@ bot.catch((err, ctx) => {
 // Start the bot
 bot.launch()
   .then(() => {
-    console.log('Bot is running with 50-image limit and hourly cleanup');
-    cleanupSessions(); // Initial cleanup
+    console.log('Bot is running with 50-image limit');
   })
   .catch(err => {
     console.error('Bot failed to start:', err);
