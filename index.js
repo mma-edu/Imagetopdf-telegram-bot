@@ -6,8 +6,35 @@ const fetch = require('node-fetch');
 // Initialize bot with environment variable
 const bot = new Telegraf(process.env.BOT_TOKEN);
 
-// Temporary in-memory storage (replace with database in production)
+// Verify bot token
+if (!process.env.BOT_TOKEN) {
+  console.error("Missing BOT_TOKEN environment variable");
+  process.exit(1);
+}
+
+// Session storage with timestamp tracking
 const userSessions = {};
+const SESSION_TIMEOUT = 60 * 60 * 1000; // 1 hour in milliseconds
+const MAX_IMAGES_PER_USER = 50; // Set to 50 as requested
+
+// Session cleanup function
+function cleanupSessions() {
+  const now = Date.now();
+  let cleanedCount = 0;
+
+  for (const userId in userSessions) {
+    if (!userSessions[userId].lastActive || 
+        (now - userSessions[userId].lastActive > SESSION_TIMEOUT)) {
+      delete userSessions[userId];
+      cleanedCount++;
+    }
+  }
+
+  console.log(`[Cleanup] Removed ${cleanedCount} inactive sessions. Current sessions: ${Object.keys(userSessions).length}`);
+}
+
+// Start hourly cleanup
+setInterval(cleanupSessions, SESSION_TIMEOUT);
 
 // Middleware to handle user sessions
 bot.use(async (ctx, next) => {
@@ -15,7 +42,12 @@ bot.use(async (ctx, next) => {
   
   const userId = ctx.from.id;
   if (!userSessions[userId]) {
-    userSessions[userId] = { images: [] };
+    userSessions[userId] = { 
+      images: [],
+      lastActive: Date.now()
+    };
+  } else {
+    userSessions[userId].lastActive = Date.now();
   }
   
   ctx.session = userSessions[userId];
@@ -27,10 +59,10 @@ bot.command('start', (ctx) => {
   ctx.reply(
     "📸➡️📄 *Image to PDF Bot*\n\n" +
     "Send me images (JPEG/PNG) and I'll convert them to a PDF file!\n\n" +
-    "• Send multiple images to combine them\n" +
+    "• Send up to 50 images to combine them\n" +
     "• Type /convert when ready\n" +
-    "• /cancel to clear your images\n"
-    "• Type /help to see how to use,
+    "• /cancel to clear your images\n" +
+    "• Type /help to see how to use",
     { parse_mode: 'Markdown' }
   );
 });
@@ -44,7 +76,8 @@ bot.command('help', (ctx) => {
     "3. I'll send you a PDF with all images\n\n" +
     "• Max 50 images per PDF\n" +
     "• Images are ordered by send time\n" +
-    "• /cancel clears your current images",
+    "• /cancel clears your current images\n" +
+    "• Sessions expire after 1 hour of inactivity",
     { parse_mode: 'Markdown' }
   );
 });
@@ -58,7 +91,7 @@ bot.command('cancel', (ctx) => {
 // Handle image messages
 bot.on('photo', async (ctx) => {
   try {
-    const photo = ctx.message.photo.pop(); // Get highest quality version
+    const photo = ctx.message.photo.pop();
     await processImage(ctx, photo);
   } catch (error) {
     console.error("Photo error:", error);
@@ -66,13 +99,15 @@ bot.on('photo', async (ctx) => {
   }
 });
 
-// Handle document messages (for files)
+// Handle document messages
 bot.on('document', async (ctx) => {
   try {
     const doc = ctx.message.document;
     const validTypes = ['image/jpeg', 'image/png', 'image/jpg'];
+    const fileExt = doc.file_name?.split('.').pop()?.toLowerCase();
     
-    if (validTypes.includes(doc.mime_type)) {
+    if (validTypes.includes(doc.mime_type) || 
+        (fileExt && ['jpg', 'jpeg', 'png'].includes(fileExt))) {
       await processImage(ctx, doc);
     } else {
       ctx.reply("⚠️ Please send JPEG or PNG images only.");
@@ -85,8 +120,8 @@ bot.on('document', async (ctx) => {
 
 // Process image attachment
 async function processImage(ctx, file) {
-  if (ctx.session.images.length >= 50) {
-    return ctx.reply("⚠️ Maximum 50 images per PDF. Type /convert to generate.");
+  if (ctx.session.images.length >= MAX_IMAGES_PER_USER) {
+    return ctx.reply(`⚠️ Maximum ${MAX_IMAGES_PER_USER} images per PDF reached. Type /convert to generate your PDF.`);
   }
 
   ctx.reply("⏳ Processing image...");
@@ -96,14 +131,16 @@ async function processImage(ctx, file) {
     const response = await fetch(fileUrl);
     const imageBuffer = await response.buffer();
     
-    // Convert to standardized format
     const processedImage = await sharp(imageBuffer)
-      .rotate() // Auto-orient based on EXIF
-      .jpeg({ quality: 90 }) // Convert to JPEG
-      .toBuffer();
+      .rotate()
+      .jpeg({ quality: 90 })
+      .toBuffer()
+      .catch(err => {
+        throw new Error("Failed to process image");
+      });
     
     ctx.session.images.push(processedImage);
-    ctx.reply(`✅ Image added (${ctx.session.images.length}/50). Send more or /convert.`);
+    ctx.reply(`✅ Image added (${ctx.session.images.length}/${MAX_IMAGES_PER_USER}). Send more or /convert.`);
   } catch (error) {
     console.error("Processing error:", error);
     ctx.reply("❌ Failed to process image. Please try another file.");
@@ -116,34 +153,38 @@ bot.command('convert', async (ctx) => {
     return ctx.reply("⚠️ No images to convert. Send images first.");
   }
 
-  ctx.reply("🛠️ Creating PDF... This may take a moment.");
+  ctx.reply("🛠️ Creating PDF... This may take a moment for 50 images.");
   
   try {
     const pdfDoc = new PDFDocument();
     const buffers = [];
+    let totalSize = 0;
+    const MAX_PDF_SIZE = 50 * 1024 * 1024; // 50MB Telegram limit
     
-    pdfDoc.on('data', buffers.push.bind(buffers));
-    
-    // Add each image to PDF
+    pdfDoc.on('data', (chunk) => {
+      buffers.push(chunk);
+      totalSize += chunk.length;
+      if (totalSize > MAX_PDF_SIZE) {
+        throw new Error("PDF would exceed Telegram's 50MB limit - try with fewer images");
+      }
+    });
+
     for (const [index, imgBuffer] of ctx.session.images.entries()) {
       const image = await sharp(imgBuffer).toBuffer();
       pdfDoc.image(image, {
-        fit: [500, 700],
+        fit: [500, 700], // Standard PDF page size
         align: 'center',
         valign: 'center'
       });
       
-      // Add new page except for last image
       if (index < ctx.session.images.length - 1) {
         pdfDoc.addPage();
       }
     }
     
-    // Finalize PDF
     pdfDoc.end();
     await new Promise(resolve => pdfDoc.on('end', resolve));
     
-    // Send PDF to user
     const pdfBuffer = Buffer.concat(buffers);
     await ctx.replyWithDocument({
       source: pdfBuffer,
@@ -152,11 +193,11 @@ bot.command('convert', async (ctx) => {
       caption: `📄 Your PDF (${ctx.session.images.length} images)`
     });
     
-    // Clear session
+    // Clear session after successful conversion
     ctx.session.images = [];
   } catch (error) {
     console.error("PDF error:", error);
-    ctx.reply("❌ Failed to create PDF. Please try again.");
+    ctx.reply(`❌ Failed to create PDF: ${error.message}\nTry with fewer images or lower resolution.`);
   }
 });
 
@@ -166,7 +207,17 @@ bot.catch((err, ctx) => {
   ctx.reply("❌ An error occurred. Please try again later.");
 });
 
-// Vercel serverless function handler
+// Start the bot
+bot.launch()
+  .then(() => {
+    console.log('Bot is running with 50-image limit and hourly cleanup');
+    cleanupSessions(); // Initial cleanup
+  })
+  .catch(err => {
+    console.error('Bot failed to start:', err);
+  });
+
+// For serverless environments
 module.exports = async (req, res) => {
   if (req.method === 'POST') {
     try {
@@ -180,9 +231,3 @@ module.exports = async (req, res) => {
     res.status(200).send('Use POST requests only');
   }
 };
-
-// Local development support
-if (process.env.NODE_ENV === 'development') {
-  bot.launch();
-  console.log('Bot running in development mode');
-}
