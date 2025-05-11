@@ -5,6 +5,7 @@ const axios = require('axios');
 const express = require('express');
 
 const app = express();
+app.use(express.json()); // Add JSON middleware for all routes
 const bot = new Telegraf(process.env.BOT_TOKEN);
 
 // ======================
@@ -70,8 +71,13 @@ bot.command('cancel', (ctx) => {
 // 4. IMAGE PROCESSING
 // ======================
 async function downloadImage(url) {
-  const response = await axios.get(url, { responseType: 'arraybuffer' });
-  return Buffer.from(response.data, 'binary');
+  try {
+    const response = await axios.get(url, { responseType: 'arraybuffer' });
+    return Buffer.from(response.data, 'binary');
+  } catch (error) {
+    console.error('Download error:', error);
+    throw new Error('Failed to download image');
+  }
 }
 
 async function processImage(ctx, file) {
@@ -83,8 +89,11 @@ async function processImage(ctx, file) {
     const fileUrl = await ctx.telegram.getFileLink(file.file_id);
     const imageBuffer = await downloadImage(fileUrl.href);
     
-    // Store both buffer and metadata
-    const metadata = await sharp(imageBuffer).metadata();
+    // Verify the image is valid
+    const metadata = await sharp(imageBuffer).metadata().catch(() => {
+      throw new Error('Invalid image file');
+    });
+    
     ctx.session.images.push({
       buffer: imageBuffer,
       width: metadata.width,
@@ -94,8 +103,8 @@ async function processImage(ctx, file) {
 
     ctx.reply(`✅ Added image (${ctx.session.images.length}/${MAX_IMAGES})\nType /convert when ready`);
   } catch (error) {
-    console.error("Image error:", error);
-    ctx.reply("❌ Failed to process image. Please try another file.");
+    console.error("Image processing error:", error);
+    ctx.reply("❌ Failed to process image. Please send a valid JPEG/PNG file.");
   }
 }
 
@@ -152,19 +161,20 @@ bot.command('convert', async (ctx) => {
       });
     }
 
-    await new Promise(resolve => {
-      pdfDoc.on('end', resolve);
+    const pdfBuffer = await new Promise((resolve, reject) => {
+      pdfDoc.on('end', () => resolve(Buffer.concat(chunks)));
+      pdfDoc.on('error', reject);
       pdfDoc.end();
     });
 
     await ctx.replyWithDocument({
-      source: Buffer.concat(chunks),
+      source: pdfBuffer,
       filename: `images_${Date.now()}.pdf`
     });
 
     ctx.session.images = [];
   } catch (error) {
-    console.error("PDF error:", error);
+    console.error("PDF generation error:", error);
     ctx.reply(`❌ PDF creation failed: ${error.message}\nTry with fewer images or visit imagestopdf.vercel.app`);
   }
 });
@@ -187,10 +197,10 @@ module.exports = async (req, res) => {
       res.status(200).end();
     } catch (err) {
       console.error('Webhook error:', err);
-      res.status(500).end();
+      res.status(500).json({ error: 'Internal server error' });
     }
   } else {
-    res.status(200).send('Use POST requests only');
+    res.status(405).json({ error: 'Method not allowed' });
   }
 };
 
@@ -199,7 +209,6 @@ module.exports = async (req, res) => {
 // ======================
 if (process.env.NODE_ENV === 'development') {
   const PORT = process.env.PORT || 3000;
-  app.use(express.json());
   app.post('/webhook', async (req, res) => {
     try {
       await bot.handleUpdate(req.body);
@@ -210,7 +219,10 @@ if (process.env.NODE_ENV === 'development') {
     }
   });
   
+  app.get('/', (req, res) => res.send('Bot is running'));
+  
   app.listen(PORT, () => {
     console.log(`🚀 Development server running on port ${PORT}`);
+    console.log(`Set webhook to: http://your-domain/webhook`);
   });
 }
