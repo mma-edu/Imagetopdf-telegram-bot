@@ -5,20 +5,16 @@ const axios = require('axios');
 const express = require('express');
 
 const app = express();
-app.use(express.json()); // Add JSON middleware for all routes
+app.use(express.json());
 const bot = new Telegraf(process.env.BOT_TOKEN);
 
-// ======================
 // 1. INITIALIZATION CHECKS
-// ======================
 if (!process.env.BOT_TOKEN) {
   console.error("❌ Missing BOT_TOKEN");
   process.exit(1);
 }
 
-// ======================
 // 2. SESSION MANAGEMENT
-// ======================
 const userSessions = {};
 const MAX_IMAGES = 50;
 
@@ -41,9 +37,7 @@ bot.use(async (ctx, next) => {
   await next();
 });
 
-// ======================
 // 3. BOT COMMANDS
-// ======================
 bot.command('start', (ctx) => {
   ctx.reply(
     "📸➡️📄 *Image to PDF Bot*\n\n" +
@@ -67,13 +61,14 @@ bot.command('cancel', (ctx) => {
   ctx.reply("🗑️ Cleared all images!");
 });
 
-// ======================
 // 4. IMAGE PROCESSING
-// ======================
 async function downloadImage(url) {
   try {
-    const response = await axios.get(url, { responseType: 'arraybuffer' });
-    return Buffer.from(response.data, 'binary');
+    const response = await axios.get(url, { 
+      responseType: 'arraybuffer',
+      timeout: 10000
+    });
+    return Buffer.from(response.data);
   } catch (error) {
     console.error('Download error:', error);
     throw new Error('Failed to download image');
@@ -89,16 +84,18 @@ async function processImage(ctx, file) {
     const fileUrl = await ctx.telegram.getFileLink(file.file_id);
     const imageBuffer = await downloadImage(fileUrl.href);
     
-    // Verify the image is valid
-    const metadata = await sharp(imageBuffer).metadata().catch(() => {
-      throw new Error('Invalid image file');
-    });
+    // Verify and process image
+    const processedImage = await sharp(imageBuffer)
+      .rotate()
+      .jpeg({ quality: 90 })
+      .toBuffer();
+
+    const metadata = await sharp(processedImage).metadata();
     
     ctx.session.images.push({
-      buffer: imageBuffer,
+      buffer: processedImage,
       width: metadata.width,
-      height: metadata.height,
-      format: metadata.format
+      height: metadata.height
     });
 
     ctx.reply(`✅ Added image (${ctx.session.images.length}/${MAX_IMAGES})\nType /convert when ready`);
@@ -108,13 +105,14 @@ async function processImage(ctx, file) {
   }
 }
 
+// 5. MESSAGE HANDLERS
 bot.on('photo', async (ctx) => {
   await processImage(ctx, ctx.message.photo.pop());
 });
 
 bot.on('document', async (ctx) => {
   const doc = ctx.message.document;
-  const validTypes = ['image/jpeg', 'image/png', 'image/jpg'];
+  const validTypes = ['image/jpeg', 'image/png'];
   const fileExt = doc.file_name?.split('.').pop()?.toLowerCase();
   
   if (validTypes.includes(doc.mime_type) || (fileExt && ['jpg', 'jpeg', 'png'].includes(fileExt))) {
@@ -124,45 +122,40 @@ bot.on('document', async (ctx) => {
   }
 });
 
-// ======================
-// 5. PDF GENERATION (PRESERVING ORIGINAL DIMENSIONS)
-// ======================
+// 6. PDF GENERATION
 bot.command('convert', async (ctx) => {
   if (!ctx.session.images?.length) {
     return ctx.reply("⚠️ No images to convert");
   }
 
-  ctx.reply("⏳ Creating PDF...");
-
   try {
+    await ctx.reply("⏳ Creating PDF...");
+    
     const pdfDoc = new PDFDocument({ autoFirstPage: false });
-    const chunks = [];
+    const buffers = [];
     let pdfSize = 0;
 
-    pdfDoc.on('data', chunk => {
-      chunks.push(chunk);
+    pdfDoc.on('data', (chunk) => {
+      buffers.push(chunk);
       pdfSize += chunk.length;
       if (pdfSize > 45 * 1024 * 1024) {
-        throw new Error("PDF reached 45MB limit - try with fewer images");
+        throw new Error("PDF reached 45MB limit");
       }
     });
 
-    for (const imgData of ctx.session.images) {
-      // Create page matching image dimensions (in PDF points: 1pt = 1/72 inch)
-      const pageWidth = imgData.width * 72 / 96; // Convert pixels to points (assuming 96dpi)
-      const pageHeight = imgData.height * 72 / 96;
+    for (const img of ctx.session.images) {
+      const pageWidth = img.width * 72 / 96;
+      const pageHeight = img.height * 72 / 96;
       
       pdfDoc.addPage({ size: [pageWidth, pageHeight] });
-      pdfDoc.image(imgData.buffer, 0, 0, { 
+      pdfDoc.image(img.buffer, 0, 0, {
         width: pageWidth,
-        height: pageHeight,
-        align: 'center',
-        valign: 'center'
+        height: pageHeight
       });
     }
 
     const pdfBuffer = await new Promise((resolve, reject) => {
-      pdfDoc.on('end', () => resolve(Buffer.concat(chunks)));
+      pdfDoc.on('end', () => resolve(Buffer.concat(buffers)));
       pdfDoc.on('error', reject);
       pdfDoc.end();
     });
@@ -174,55 +167,33 @@ bot.command('convert', async (ctx) => {
 
     ctx.session.images = [];
   } catch (error) {
-    console.error("PDF generation error:", error);
-    ctx.reply(`❌ PDF creation failed: ${error.message}\nTry with fewer images or visit imagestopdf.vercel.app`);
+    console.error("PDF error:", error);
+    ctx.reply(`❌ PDF creation failed: ${error.message}`);
   }
 });
 
-// ======================
-// 6. ERROR HANDLING
-// ======================
+// 7. ERROR HANDLING
 bot.catch((err, ctx) => {
   console.error(`Bot error:`, err);
   ctx.reply("❌ Bot encountered an error. Please try again later.");
 });
 
-// ======================
-// 7. VERCEL SERVERLESS FUNCTION HANDLER
-// ======================
-module.exports = async (req, res) => {
-  if (req.method === 'POST') {
-    try {
-      await bot.handleUpdate(req.body);
-      res.status(200).end();
-    } catch (err) {
-      console.error('Webhook error:', err);
-      res.status(500).json({ error: 'Internal server error' });
-    }
-  } else {
-    res.status(405).json({ error: 'Method not allowed' });
-  }
-};
+// 8. SERVER CONFIGURATION
+module.exports = app;
 
-// ======================
-// 8. LOCAL DEVELOPMENT SERVER (OPTIONAL)
-// ======================
-if (process.env.NODE_ENV === 'development') {
+app.post('/api', async (req, res) => {
+  try {
+    await bot.handleUpdate(req.body);
+    res.status(200).end();
+  } catch (err) {
+    console.error('Webhook error:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+if (require.main === module) {
   const PORT = process.env.PORT || 3000;
-  app.post('/webhook', async (req, res) => {
-    try {
-      await bot.handleUpdate(req.body);
-      res.status(200).end();
-    } catch (err) {
-      console.error('Webhook error:', err);
-      res.status(500).end();
-    }
-  });
-  
-  app.get('/', (req, res) => res.send('Bot is running'));
-  
   app.listen(PORT, () => {
-    console.log(`🚀 Development server running on port ${PORT}`);
-    console.log(`Set webhook to: http://your-domain/webhook`);
+    console.log(`🚀 Server running on port ${PORT}`);
   });
 }
